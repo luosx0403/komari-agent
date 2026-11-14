@@ -89,6 +89,16 @@ func Open(path, bootID string) (*Store, error) {
 // Update commits totals before returning them for upload. A failed write retains
 // the previous totals and baseline so the next successful sample catches up.
 func (s *Store) Update(counters []Counter) (uint64, uint64, error) {
+	return s.update(counters, true)
+}
+
+// UpdateMemory is opt-in for flash-backed systems. Call Update periodically and
+// on shutdown to checkpoint; a crash can lose uncheckpointed increments.
+func (s *Store) UpdateMemory(counters []Counter) (uint64, uint64, error) {
+	return s.update(counters, false)
+}
+
+func (s *Store) update(counters []Counter, persist bool) (uint64, uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	next := s.current
@@ -117,6 +127,10 @@ func (s *Store) Update(counters []Counter) (uint64, uint64, error) {
 		next.TotalUp += up
 		next.TotalDown += down
 		next.Counters[c.Name] = reading{Tx: c.Tx, Rx: c.Rx}
+	}
+	if !persist {
+		s.current = next
+		return next.TotalUp, next.TotalDown, nil
 	}
 	committed, err := s.save(next)
 	if committed {

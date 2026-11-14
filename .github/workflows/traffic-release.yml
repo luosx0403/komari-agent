@@ -89,6 +89,7 @@ jobs:
           (cd release-assets && sha256sum komari-agent-* install-traffic-patch.sh TRAFFIC-PATCH.md > SHA256SUMS)
           cat > release-notes.md <<NOTES
           Lifetime traffic totals for Linux and macOS, amd64 and arm64.
+          Includes the tested iStoreOS x86/64 procd adapter and reduced-flash-write mode.
           Built from commit ${GITHUB_SHA}. Native Linux/macOS tests passed before publishing.
           Agent auto-update remains enabled by default and tracks ${GH_REPO}.
           Installation and rollback: see TRAFFIC-PATCH.md.

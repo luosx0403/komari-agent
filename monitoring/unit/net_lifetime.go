@@ -37,7 +37,7 @@ func StartPersistentNetwork(path string, interval float64) error {
 		return err
 	}
 	persistentNetwork.store = store
-	if _, _, _, _, err := samplePersistentNetwork(); err != nil {
+	if _, _, _, _, err := samplePersistentNetwork(true); err != nil {
 		_ = store.Close()
 		persistentNetwork.store = nil
 		return fmt.Errorf("initialize lifetime network state: %w", err)
@@ -54,7 +54,7 @@ func StartPersistentNetwork(path string, interval float64) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if _, _, _, _, err := samplePersistentNetwork(); err != nil {
+				if _, _, _, _, err := samplePersistentNetwork(true); err != nil {
 					log.Printf("Lifetime network checkpoint failed: %v", err)
 				}
 			}
@@ -66,7 +66,7 @@ func StartPersistentNetwork(path string, interval float64) error {
 
 // Serialize both reading counters and committing them; a stale concurrent sample
 // must never be mistaken for a counter reset.
-func samplePersistentNetwork() (rawUp, rawDown, totalUp, totalDown uint64, err error) {
+func samplePersistentNetwork(persist bool) (rawUp, rawDown, totalUp, totalDown uint64, err error) {
 	persistentNetwork.Lock()
 	defer persistentNetwork.Unlock()
 	store := persistentNetwork.store
@@ -90,12 +90,16 @@ func samplePersistentNetwork() (rawUp, rawDown, totalUp, totalDown uint64, err e
 			counters = append(counters, nettotal.Counter{Name: io.Name, Tx: io.BytesSent, Rx: io.BytesRecv})
 		}
 	}
-	totalUp, totalDown, err = store.Update(counters)
+	if persist {
+		totalUp, totalDown, err = store.Update(counters)
+	} else {
+		totalUp, totalDown, err = store.UpdateMemory(counters)
+	}
 	return rawUp, rawDown, totalUp, totalDown, err
 }
 
 func persistentNetworkSpeed() (totalUp, totalDown, upSpeed, downSpeed uint64, err error) {
-	rawUp, rawDown, totalUp, totalDown, err := samplePersistentNetwork()
+	rawUp, rawDown, totalUp, totalDown, err := samplePersistentNetwork(flags.NetworkSyncOnReport)
 	if err != nil {
 		return totalUp, totalDown, 0, 0, err
 	}
@@ -109,7 +113,7 @@ func StopPersistentNetwork() error {
 	}
 	persistentNetwork.cancel()
 	<-persistentNetwork.done
-	_, _, _, _, err := samplePersistentNetwork()
+	_, _, _, _, err := samplePersistentNetwork(true)
 	// Keep the process lock until os.Exit, including while a report finishes.
 	return err
 }

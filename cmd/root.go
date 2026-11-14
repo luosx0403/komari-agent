@@ -188,6 +188,7 @@ func Execute() {
 }
 
 func init() {
+	RootCmd.PersistentFlags().BoolVar(&flags.NetworkSyncOnReport, "network-sync-on-report", true, "Sync lifetime state before each report; disable to reduce flash writes")
 	RootCmd.PersistentFlags().StringVar(&flags.NetworkMode, "network-mode", "official", "Network totals: official or lifetime (Linux/macOS)")
 	RootCmd.PersistentFlags().StringVar(&flags.NetworkStateFile, "network-state-file", "", "Absolute lifetime state path; default ./network-total.json")
 	RootCmd.PersistentFlags().Float64Var(&flags.NetworkSaveInterval, "network-save-interval", 5, "Background lifetime checkpoint interval in seconds; reports also checkpoint")

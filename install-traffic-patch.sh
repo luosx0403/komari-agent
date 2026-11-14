@@ -25,7 +25,7 @@ import uuid
 
 DEFAULT_REPO = "luosx0403/komari-agent"
 OFFICIAL_REPO = "komari-monitor/komari-agent"
-KEYS = ("AGENT_NETWORK_MODE", "AGENT_NETWORK_STATE_FILE", "AGENT_NETWORK_SAVE_INTERVAL", "AGENT_UPDATE_REPO")
+KEYS = ("AGENT_NETWORK_MODE", "AGENT_NETWORK_STATE_FILE", "AGENT_NETWORK_SAVE_INTERVAL", "AGENT_UPDATE_REPO", "AGENT_NETWORK_SYNC_ON_REPORT")
 
 
 def run(args, check=True):
@@ -79,7 +79,76 @@ def download_release(repo, version, destination, enhanced):
         info = json.loads(run([str(destination), "build-info"]).stdout)
         if not info.get("lifetime_network") or info.get("network_state_version") != 1:
             raise RuntimeError("binary does not support lifetime traffic state v1")
+        if is_openwrt() and not info.get("network_sync_on_report_option"):
+            raise RuntimeError("iStoreOS requires a newer release with configurable report checkpointing")
     return expected, release["tag_name"]
+
+
+PROCD_BEGIN = "# BEGIN KOMARI LIFETIME TRAFFIC PATCH"
+PROCD_END = "# END KOMARI LIFETIME TRAFFIC PATCH"
+
+
+def is_openwrt():
+    return pathlib.Path("/etc/openwrt_release").is_file() and pathlib.Path("/sbin/procd").exists()
+
+
+def clean_procd_script(text):
+    return re.sub(r"(?m)^\s*"+re.escape(PROCD_BEGIN)+r"\n.*?^\s*"+re.escape(PROCD_END)+r"\n?", "", text, flags=re.S)
+
+
+def procd_script(text, settings):
+    text = clean_procd_script(text)
+    if not settings:
+        return text
+    pattern = r"(?m)^([ \t]*)procd_close_instance[ \t]*$"
+    if len(re.findall(pattern, text)) != 1:
+        raise RuntimeError("this adapter requires one standard procd instance")
+    for value in settings.values():
+        if any(c in value for c in "\n\r\x00"):
+            raise ValueError("multiline procd environment values are not supported")
+    block = PROCD_BEGIN+"\n    procd_append_param env "+" ".join(shlex.quote(k+"="+v) for k,v in settings.items())+"\n    "+PROCD_END+"\n"
+    return re.sub(pattern, lambda m: m[1]+block+m[0], text)
+
+
+def procd_instances(service):
+    result = run(["ubus", "call", "service", "list", json.dumps({"name":service})])
+    return list(json.loads(result.stdout).get(service, {}).get("instances", {}).values())
+
+
+def openwrt_plan(args):
+    if args.scope == "user":
+        raise RuntimeError("the iStoreOS adapter uses a system procd service")
+    service = args.service.removesuffix(".service")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", service):
+        raise ValueError("invalid procd service name")
+    config = pathlib.Path("/etc/init.d")/service
+    text = config.read_text()
+    if not re.search(r"(?m)^USE_PROCD=1\s*$", text):
+        raise RuntimeError("existing service is not a standard procd script")
+    instances = procd_instances(service)
+    if len(instances) > 1:
+        raise RuntimeError("multiple procd instances need a separate adapter")
+    instance = instances[0] if instances else {}
+    if instance.get("user", "root") != "root":
+        raise RuntimeError("this iStoreOS adapter expects the existing root Komari service")
+    command = instance.get("command", [])
+    if command:
+        executable = command[0]
+    else:
+        match = re.search(r"(?m)^PROG=(.+)$", text)
+        values = shlex.split(match[1]) if match else []
+        if len(values) != 1 or not values[0].startswith("/"):
+            raise RuntimeError("cannot identify inactive procd executable from a static PROG assignment")
+        executable = values[0]
+    binary = pathlib.Path(args.binary or executable).resolve()
+    if binary != pathlib.Path(executable).resolve():
+        raise RuntimeError("--binary must match the existing procd executable")
+    state = pathlib.Path(args.state_file or "/etc/komari-agent-lifetime/network-total.json").resolve()
+    for location in (binary, state):
+        if not location.is_absolute() or any(location == root or root in location.parents for root in (pathlib.Path("/tmp"),pathlib.Path("/run"),pathlib.Path("/dev"))):
+            raise RuntimeError("iStoreOS binary and state must be on persistent storage, not /tmp or volatile /var")
+    procd_script(text, {"AGENT_NETWORK_MODE":"lifetime"})  # Validate before any stop or write.
+    return dict(kind="procd", scope="system", service=service, binary=str(binary), config=str(config), uid=0, gid=0, state_file=str(state), active=bool(instance.get("running")))
 
 
 def linux_plan(args):
@@ -152,6 +221,10 @@ def atomic_copy(source, target, mode=None):
 
 
 def service_control(plan, action, check=True):
+    if plan["kind"] == "procd":
+        if action == "reload":
+            return None
+        return run([plan["config"], action], check)
     if plan["kind"] == "systemd":
         ctl = ["systemctl"] + (["--user"] if plan["scope"] == "user" else [])
         return run(ctl + (["daemon-reload"] if action == "reload" else [action, plan["service"]]), check)
@@ -164,7 +237,9 @@ def service_control(plan, action, check=True):
 
 def verify_service(plan):
     for _ in range(10):
-        if plan["kind"] == "systemd":
+        if plan["kind"] == "procd":
+            ok = any(i.get("running") for i in procd_instances(plan["service"]))
+        elif plan["kind"] == "systemd":
             ctl = ["systemctl"] + (["--user"] if plan["scope"] == "user" else [])
             ok = run(ctl+["is-active", "--quiet", plan["service"]], False).returncode == 0
         else:
@@ -180,7 +255,7 @@ def restore(plan, backup):
     atomic_copy(backup/"agent", plan["binary"], 0o755)
     config = pathlib.Path(plan["config"])
     if (backup/"config").exists():
-        atomic_copy(backup/"config", config)
+        atomic_copy(backup/"config", config, 0o755 if plan["kind"] == "procd" else None)
     else:
         config.unlink(missing_ok=True)
     service_control(plan, "reload")
@@ -230,9 +305,15 @@ def apply(manifest):
                     os.chown(state_dir, plan["uid"], plan["gid"])
         atomic_copy(data["artifact"], binary, 0o755)
         settings = {} if data["official"] else dict(zip(KEYS, [data["mode"], plan["state_file"], str(data["save_interval"]), data["repo"]]))
+        if not data["official"]:
+            settings["AGENT_NETWORK_SYNC_ON_REPORT"] = str(data.get("sync_on_report", True)).lower()
         if data["disable_auto_update"] is not None and not data["official"]:
             settings["AGENT_DISABLE_AUTO_UPDATE"] = str(data["disable_auto_update"]).lower()
-        if plan["kind"] == "systemd":
+        if plan["kind"] == "procd":
+            staged = pathlib.Path(manifest).parent/"procd-init"
+            staged.write_text(procd_script(config.read_text(), settings))
+            atomic_copy(staged, config, 0o755)
+        elif plan["kind"] == "systemd":
             if data["official"]:
                 config.unlink(missing_ok=True)
             else:
@@ -475,7 +556,8 @@ def main(argv=None):
     parser.add_argument("--plist", help="existing macOS launchd plist")
     parser.add_argument("--binary", help="must match the existing service executable")
     parser.add_argument("--state-file")
-    parser.add_argument("--save-interval", type=float, default=5)
+    parser.add_argument("--save-interval", type=float, default=None, help="checkpoint seconds; default 300 on iStoreOS, 5 elsewhere")
+    parser.add_argument("--network-sync-on-report", choices=["true", "false"], default=None, help="default false on iStoreOS to reduce flash writes, true elsewhere")
     parser.add_argument("--disable-auto-update", dest="disable_auto_update", action="store_const", const=True, default=None)
     parser.add_argument("--enable-auto-update", dest="disable_auto_update", action="store_const", const=False)
     parser.add_argument("--no-restart", action="store_true")
@@ -497,6 +579,10 @@ def main(argv=None):
     if args.apply:
         apply(args.apply)
         return
+    openwrt = platform.system() == "Linux" and is_openwrt()
+    if args.save_interval is None:
+        args.save_interval = 300 if openwrt else 5
+    sync_on_report = args.network_sync_on_report != "false" if args.network_sync_on_report is not None else not openwrt
     if not 0.1 <= args.save_interval <= 3600:
         parser.error("save interval must be between 0.1 and 3600 seconds")
     repo = OFFICIAL_REPO if args.official else valid_repo(args.repo)
@@ -507,7 +593,9 @@ def main(argv=None):
         (directory/"SHA256SUMS").write_text(digest+"  agent\n")
         print(f"Downloaded and verified {version}: {directory/'agent'}")
         return
-    if platform.system() == "Linux":
+    if openwrt:
+        plan = openwrt_plan(args)
+    elif platform.system() == "Linux":
         plan = linux_plan(args)
     elif platform.system() == "Darwin":
         plan = mac_plan(args)
@@ -519,7 +607,7 @@ def main(argv=None):
     stage = pathlib.Path(tempfile.mkdtemp(prefix="komari-traffic-patch-"))
     keep_stage = False
     try:
-        data = dict(plan=plan, action="install", mode=args.mode, official=args.official, repo=repo, save_interval=args.save_interval, disable_auto_update=args.disable_auto_update, no_restart=args.no_restart)
+        data = dict(plan=plan, action="install", mode=args.mode, official=args.official, repo=repo, save_interval=args.save_interval, disable_auto_update=args.disable_auto_update, no_restart=args.no_restart, sync_on_report=sync_on_report)
         if args.rollback:
             # System backups are private; read the rollback pointer only after elevation.
             data.update(action="rollback")

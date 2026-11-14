@@ -1,6 +1,7 @@
 package flags_pkg
 
 type Config struct {
+	NetworkSyncOnReport bool    `json:"network_sync_on_report" env:"AGENT_NETWORK_SYNC_ON_REPORT"`
 	NetworkMode         string  `json:"network_mode" env:"AGENT_NETWORK_MODE"`
 	NetworkStateFile    string  `json:"network_state_file" env:"AGENT_NETWORK_STATE_FILE"`
 	NetworkSaveInterval float64 `json:"network_save_interval" env:"AGENT_NETWORK_SAVE_INTERVAL"`

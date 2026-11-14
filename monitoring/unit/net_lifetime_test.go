@@ -30,6 +30,9 @@ func TestPersistentNetworkUsesRawCountersForSpeedAndRetainsTotalsOnError(t *test
 		t.Fatal(err)
 	}
 	old := persistentNetwork.store
+	oldSync := flags.NetworkSyncOnReport
+	flags.NetworkSyncOnReport = true
+	defer func() { flags.NetworkSyncOnReport = oldSync }()
 	oldMode, oldInclude, oldExclude := flags.NetworkMode, flags.IncludeNics, flags.ExcludeNics
 	persistentNetwork.store = store
 	flags.NetworkMode = "lifetime"

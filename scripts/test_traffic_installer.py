@@ -102,6 +102,51 @@ class InstallerTests(unittest.TestCase):
             installer.valid_repo("x/y?token=oops")
 
 
+class OpenWrtTests(unittest.TestCase):
+    setUp = InstallerTests.setUp
+    apply = InstallerTests.apply
+    def procd_fixture(self):
+        self.plan.update(kind="procd", service="komari-agent")
+        self.original = "#!/bin/sh /etc/rc.common\nUSE_PROCD=1\nPROG='/opt/komari/agent'\nARGS='--token dummy-secret'\nstart_service() {\n    procd_open_instance\n    procd_set_param command \"$PROG\"\n    procd_append_param command $ARGS\n    procd_close_instance\n}\n"
+        self.config.write_text(self.original)
+        self.config.chmod(0o755)
+        self.data.update(sync_on_report=False,save_interval=300)
+
+    @patch.object(installer,"service_control")
+    def test_procd_patch_and_rollback_keep_args_and_executable_init(self,control):
+        self.procd_fixture()
+        self.apply()
+        text=self.config.read_text()
+        self.assertIn("ARGS='--token dummy-secret'",text)
+        self.assertIn("AGENT_NETWORK_SYNC_ON_REPORT=false",text)
+        self.assertIn("AGENT_NETWORK_SAVE_INTERVAL=300",text)
+        self.assertEqual(text.count(installer.PROCD_BEGIN),1)
+        self.data.update(original_sha256=installer.sha256(self.binary))
+        self.apply()
+        self.assertEqual(self.config.read_text().count(installer.PROCD_BEGIN),1)
+        self.data.update(action="rollback")
+        self.apply()
+        self.assertTrue(self.config.stat().st_mode & 0o111)
+
+    @patch.object(installer,"service_control")
+    def test_procd_official_removes_patch_keeps_original_init(self,control):
+        self.procd_fixture()
+        self.apply()
+        self.data.update(official=True,original_sha256=installer.sha256(self.binary))
+        self.apply()
+        self.assertEqual(self.config.read_text(),self.original)
+        self.assertTrue(self.config.stat().st_mode & 0o111)
+
+    def test_rejects_nonstandard_multiple_instances(self):
+        with self.assertRaisesRegex(RuntimeError,"one standard"):
+            installer.procd_script("procd_close_instance\nprocd_close_instance\n",{"AGENT_NETWORK_MODE":"lifetime"})
+
+    def test_procd_settings_quote_paths_without_shell_injection(self):
+        text=installer.procd_script("procd_close_instance\n",{"KEY":"/mnt/a b/'test'"})
+        command=next(line for line in text.splitlines() if "procd_append_param" in line)
+        self.assertEqual(installer.shlex.split(command)[2:],["KEY=/mnt/a b/'test'"])
+
+
 class AuthenticationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

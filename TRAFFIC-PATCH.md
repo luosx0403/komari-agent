@@ -23,6 +23,33 @@ sh install-komari-traffic-patch.sh --dry-run
 
 系统级安装使用 Linux Polkit / macOS 图形认证窗口，密码只在图形窗口输入。脚本不会使用终端密码回退。SSH 可使用目标机器的活动图形会话认证（下节说明）；没有可用桌面时输出已准备的命令，供目标机器的本地图形桌面执行。用户级安装不需要管理员权限。
 
+## iStoreOS 定向适配
+
+已针对 iStoreOS 25.12.5（x86/64，Python 3.13，root、procd）适配。复用 Actions 的 `komari-agent-linux-amd64`，不要求 systemd、不安装额外依赖。支持的是现有标准单实例 procd Komari 服务；其他 OpenWrt 版本和架构未做实机验证。
+
+在该环境直接执行同一安装脚本即可：
+
+```sh
+python3 install-komari-traffic-patch.sh --dry-run
+python3 install-komari-traffic-patch.sh
+```
+
+默认探测 `/etc/init.d/komari-agent` 和 procd 的实际可执行文件，保留原有主控地址、令牌与启动参数，在 `procd_close_instance` 前插入受标记的环境设置。默认每 **300 秒**写盘，上报之间在内存累计，正常停止时再保存；默认状态文件是持久化 overlay 上的 `/etc/komari-agent-lifetime/network-total.json`，拒绝将二进制或状态放在 `/tmp`、`/run`、`/dev`（包括解析软链接后指向这些目录的 `/var`）。自动更新默认保持原有设置。
+
+```sh
+# 缩短断电时可能丢失的窗口，但会增加闪存写入
+python3 install-komari-traffic-patch.sh --save-interval 60
+
+# 每次上报前写盘；更适合状态放在外置 SSD 的情况
+python3 install-komari-traffic-patch.sh --network-sync-on-report true
+
+# 回滚与恢复官方二进制仍可使用
+python3 install-komari-traffic-patch.sh --rollback
+python3 install-komari-traffic-patch.sh --official
+```
+
+正常 Agent 重启和正常系统重启会保存并接续累计量；异常断电最多可能丢失上一次落盘后的增量，默认约 5 分钟。状态持久化针对普通重启，未承诺固件升级、恢复出厂或删除 overlay 后保留。通过已有 SSH 私钥登录 root 时无需再次提权；私钥不由脚本管理。
+
 ## SSH 下认证
 
 SSH 不再被直接拒绝，默认 `--auth auto` 会探测真实的目标桌面：
@@ -89,6 +116,7 @@ sh install-komari-traffic-patch.sh --no-restart
 | `--network-mode official\|lifetime` | `AGENT_NETWORK_MODE` / `network_mode` | `official`；安装脚本设置 `lifetime` |
 | `--network-state-file /absolute/path` | `AGENT_NETWORK_STATE_FILE` / `network_state_file` | 工作目录的 `network-total.json` |
 | `--network-save-interval 5` | `AGENT_NETWORK_SAVE_INTERVAL` / `network_save_interval` | 5 秒，允许 0.1–3600 |
+| `--network-sync-on-report=true/false` | `AGENT_NETWORK_SYNC_ON_REPORT` / `network_sync_on_report` | Agent 默认为 true，iStoreOS 安装脚本设为 false |
 | `--update-repo owner/name` | `AGENT_UPDATE_REPO` / `update_repo` | 编译时的仓库；本 fork 为 `luosx0403/komari-agent` |
 | `--update-repo official` | 同上 | 选择官方更新源；实际降级应使用安装脚本 `--official` |
 
@@ -101,7 +129,7 @@ sh install-komari-traffic-patch.sh --no-restart
 - 首次启用时接入当前筛选后网卡的已有累计量，之后永远增量累计，不按月清零。
 - Linux 使用内核 boot ID；macOS 使用 `kern.boottime`。同次开机重启 Agent 只计算新流量；系统重启则将新开机网卡读数加到历史总量。
 - 每张网卡单独保留基线，沿用上游 `--include-nics` / `--exclude-nics` 规则，防止单个网卡归零影响其他网卡。
-- 默认后台每 5 秒保存一次，主控不可达时仍采样；每次上报前也先保存。正常关闭做最后一次保存。
+- 默认后台每 5 秒保存一次，主控不可达时仍采样；默认每次上报前也先保存；iStoreOS 的减少写盘模式除外。正常关闭做最后一次保存。
 - 状态文件通过临时文件、fsync、原子 rename 写入，另有进程锁；状态损坏或被另一进程占用会拒绝启动，不静默清零。运行中写盘失败保留已提交的累计量和基线，并报告错误，恢复后补计。
 - 默认系统服务位置：Linux `/var/lib/komari-agent-lifetime/network-total.json`；macOS `/Library/Application Support/Komari/network-total.json`。用户服务使用所属用户的状态目录。备份位于二进制旁 `.traffic-patch-backups/`。
 

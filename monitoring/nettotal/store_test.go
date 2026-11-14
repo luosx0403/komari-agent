@@ -102,3 +102,23 @@ func TestBootIDStable(t *testing.T) {
 		t.Fatalf("unstable boot ID: %q, %q, %v", a, b, err)
 	}
 }
+
+func TestMemoryUpdatesCheckpointOnShutdownWithoutDoubleCounting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state")
+	s := mustOpen(t, path, "boot-a")
+	checkUpdate(t, s, []Counter{{"eth0", 100, 200}}, 100, 200)
+	before, _ := os.ReadFile(path)
+	u, d, err := s.UpdateMemory([]Counter{{"eth0", 140, 260}})
+	if err != nil || u != 140 || d != 260 {
+		t.Fatalf("memory sample: %d,%d,%v", u, d, err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Fatal("memory sample wrote the flash state")
+	}
+	checkUpdate(t, s, []Counter{{"eth0", 145, 265}}, 145, 265)
+	s.Close()
+	s = mustOpen(t, path, "boot-b")
+	defer s.Close()
+	checkUpdate(t, s, []Counter{{"eth0", 10, 15}}, 155, 280)
+}

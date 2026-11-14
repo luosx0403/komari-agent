@@ -1,4 +1,4 @@
-> 本 fork 提供 Linux/macOS 永久累计流量模式、自动更新和一键补丁/回滚。参见 [TRAFFIC-PATCH.md](TRAFFIC-PATCH.md)。
+> 本 fork 提供 Linux/macOS 及指定 iStoreOS 环境的永久累计流量模式、自动更新和一键补丁/回滚。参见 [TRAFFIC-PATCH.md](TRAFFIC-PATCH.md)。
 
 # komari-agent
 
