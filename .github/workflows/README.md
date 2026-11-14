@@ -279,3 +279,24 @@ native Linux/macOS race and installer tests, cross-compiles four release assets,
 and publishes checksums plus the one-command patch installer. The inherited
 upstream workflows are repository-gated to avoid duplicate releases and Docker
 publishing in the fork. See `TRAFFIC-PATCH.md` for versions and rollback.
+
+## Follow official updates
+
+`sync-upstream.yml` checks `komari-monitor/komari-agent` main every six hours
+(`23 */6 * * *`, UTC), or on manual dispatch. It merges only unseen commits,
+retaining this fork's history and enhancements. A conflict or non-fast-forward
+push fails without overwriting main; resolve manually and rerun. If upstream is
+already included, no commit or build is created.
+
+After a successful push, it explicitly dispatches `traffic-release.yml` with the
+built-in token (`contents: write`, `actions: write`); token-generated pushes do
+not trigger ordinary push workflows. The existing Linux/macOS tests must pass
+before binaries are published, and agents then consume the fork release under
+their existing auto-update rules. No PAT or additional repository secret is
+required for normal source updates. This tracks upstream main commits, not only
+upstream release tags. GitHub's built-in token cannot grant itself permission to
+edit workflow files; upstream CI-file changes may therefore require a manual
+merge if GitHub rejects the push. No long-lived credential is provisioned.
+
+GitHub may disable public-repository scheduled workflows after 60 days without
+repository activity; re-enable this workflow if that occurs.

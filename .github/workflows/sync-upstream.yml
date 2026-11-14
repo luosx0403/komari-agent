@@ -1,0 +1,68 @@
+name: Sync Official Agent
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-official-agent
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'luosx0403/komari-agent' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge new official main commits
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/komari-monitor/komari-agent.git main
+          UPSTREAM_SHA="$(git rev-parse FETCH_HEAD)"
+          echo "Official main: ${UPSTREAM_SHA}" >> "$GITHUB_STEP_SUMMARY"
+          if git merge-base --is-ancestor "${UPSTREAM_SHA}" HEAD; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo 'Already up to date; no build needed.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git merge --no-ff --no-edit "${UPSTREAM_SHA}"; then
+            echo 'Merge conflicts; main was not pushed. Resolve manually, then rerun.' >> "$GITHUB_STEP_SUMMARY"
+            git diff --name-only --diff-filter=U >> "$GITHUB_STEP_SUMMARY"
+            git merge --abort
+            exit 1
+          fi
+          # A concurrent main update rejects this push instead of being overwritten.
+          git push origin HEAD:main
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+          echo "Merged as $(git rev-parse HEAD)." >> "$GITHUB_STEP_SUMMARY"
+
+  build-release:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Start existing test, build and release workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        # Pushes made with GITHUB_TOKEN do not trigger push workflows. An explicit
+        # workflow_dispatch does, and preserves the release workflow's run_number.
+        run: gh workflow run traffic-release.yml --ref main
