@@ -328,7 +328,7 @@ def linux_desktop():
         agents = []
         for process in processes:
             parts = process.split(None, 1)
-            if len(parts) == 2 and any(s in parts[1] for s in ("polkit-gnome", "polkit-kde", "polkit-mate", "lxpolkit", "polkit-agent")) and scope in session_scope(parts[0]):
+            if len(parts) == 2 and any(s in parts[1] for s in ("polkit-gnome", "polkit-kde", "polkit-mate", "lxpolkit", "polkit-agent", "gnome-shell")) and scope in session_scope(parts[0]):
                 agents.append(parts[0])
         cinnamon = bool(owners and len(owners[0]) > 1 and scope in session_scope(owners[0][1]))
         agent = None
