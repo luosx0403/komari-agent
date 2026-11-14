@@ -276,6 +276,193 @@ def apply(manifest):
         print("Service restart deferred; restart it manually to activate this binary.")
 
 
+class DesktopUnavailable(RuntimeError):
+    """Retain prepared files for execution at the physical desktop."""
+
+
+class AuthenticationPending(RuntimeError):
+    """Keep staged files while a desktop worker might still be running."""
+
+
+def properties(text):
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def session_scope(pid):
+    try:
+        return pathlib.Path(f"/proc/{pid}/cgroup").read_text()
+    except OSError:
+        return ""
+
+
+def linux_desktop():
+    """Read actual login sessions, bus ownership and agent placement; no elevation."""
+    uid = os.getuid()
+    sessions = run(["loginctl", "list-sessions", "--no-legend"], False)
+    environment = properties(run(["systemctl", "--user", "show-environment"], False).stdout)
+    env = os.environ.copy()
+    for name in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        env.pop(name, None)
+        if environment.get(name):
+            env[name] = environment[name]
+    runtime = pathlib.Path(environment.get("XDG_RUNTIME_DIR", f"/run/user/{uid}"))
+    if not runtime.is_dir() or runtime.stat().st_uid != uid or not (runtime/"bus").is_socket():
+        raise RuntimeError("No accessible graphical session D-Bus for this user")
+    env["XDG_RUNTIME_DIR"] = str(runtime)
+    env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path="+str(runtime/"bus")
+    bus = subprocess.run(["busctl", "--user", "list", "--no-pager", "--no-legend"], env=env, text=True, capture_output=True)
+    owners = [line.split() for line in bus.stdout.splitlines() if line.startswith("org.Cinnamon ")]
+    processes = run(["ps", "-eo", "pid=,comm="], False).stdout.splitlines()
+    for row in sessions.stdout.splitlines():
+        session = row.split()[0]
+        info = properties(run(["loginctl", "show-session", session, "-p", "User", "-p", "Active", "-p", "Remote", "-p", "Type", "-p", "Scope", "-p", "Display"], False).stdout)
+        scope = info.get("Scope", "")
+        if info.get("User") != str(uid) or info.get("Active") != "yes" or info.get("Remote") != "no" or info.get("Type") not in ("x11", "wayland") or not re.fullmatch(r"session-[A-Za-z0-9_.-]+\.scope", scope):
+            continue
+        if info.get("Display"):
+            env["DISPLAY"] = info["Display"]
+        if info["Type"] == "x11":
+            match = re.fullmatch(r":(\d+)(?:\.\d+)?", env.get("DISPLAY", ""))
+            if not match or not pathlib.Path("/tmp/.X11-unix", "X"+match[1]).is_socket():
+                continue
+        agents = []
+        for process in processes:
+            parts = process.split(None, 1)
+            if len(parts) == 2 and any(s in parts[1] for s in ("polkit-gnome", "polkit-kde", "polkit-mate", "lxpolkit", "polkit-agent")) and scope in session_scope(parts[0]):
+                agents.append(parts[0])
+        cinnamon = bool(owners and len(owners[0]) > 1 and scope in session_scope(owners[0][1]))
+        agent = None
+        if not agents and cinnamon:
+            agent = next((p for p in ("/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1", "/usr/libexec/polkit-gnome-authentication-agent-1") if os.access(p, os.X_OK)), None)
+        if not agents and not agent:
+            continue
+        if cinnamon:
+            return dict(kind="cinnamon", scope=scope, env=env, agent=agent)
+        if scope in session_scope(os.getpid()):
+            return dict(kind="direct", scope=scope, env=env, agent=None)
+    raise RuntimeError("No verified desktop authentication route: SSH currently supports an active same-user Cinnamon session; other desktops need a local graphical terminal")
+
+
+def mac_desktop():
+    uid = os.stat("/dev/console").st_uid
+    if uid == 0 or uid != os.getuid():
+        raise RuntimeError("No active macOS console desktop belonging to the SSH user")
+    run(["launchctl", "print", f"gui/{uid}"])
+    return dict(kind="launchd-auth", domain=f"gui/{uid}")
+
+
+def auth_worker(manifest, agent=None):
+    """Runs inside the verified GUI session; no password handling or retry."""
+    stage = pathlib.Path(manifest).parent
+    command = [sys.executable, str(stage/"installer.py"), "--apply", str(manifest)]
+    process = None
+    with (stage/"authorization.log").open("w") as log:
+        try:
+            if platform.system() == "Linux":
+                if agent:
+                    process = subprocess.Popen([agent], stdout=log, stderr=log)
+                    time.sleep(1)
+                    # An existing registered agent may make this one exit. Do not
+                    # start another; pkexec must use the session's registered agent.
+                result = subprocess.run(["pkexec", "--disable-internal-agent"]+command, stdout=log, stderr=log)
+            else:
+                expression = "do shell script "+json.dumps(shlex.join(command))+" with administrator privileges"
+                result = subprocess.run(["osascript", "-e", expression], stdout=log, stderr=log)
+            code = result.returncode
+        except Exception as error:
+            print(str(error), file=log)
+            code = 1
+        finally:
+            if process and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+    temporary = stage/"authorization-result.tmp"
+    temporary.write_text(str(code))
+    os.replace(temporary, stage/"authorization-result")
+
+
+def wait_desktop_result(stage, name, timeout):
+    target = stage/name
+    deadline = time.monotonic()+timeout
+    while not target.exists():
+        if time.monotonic() >= deadline:
+            raise AuthenticationPending(f"Desktop operation is still pending; staged files retained at {stage}. Do not retry while its authentication window is open")
+        time.sleep(0.1)
+    return target.read_text()
+
+
+def cinnamon_spawn(route, wrapper):
+    # Eval contains only one generated absolute wrapper path, never a command,
+    # manifest content, service arguments, passwords or caller-supplied text.
+    expression = "imports.misc.util.spawnCommandLine("+json.dumps(shlex.quote(str(wrapper)))+")"
+    result = subprocess.run(["gdbus", "call", "--session", "--dest", "org.Cinnamon", "--object-path", "/org/Cinnamon", "--method", "org.Cinnamon.Eval", expression], env=route["env"], text=True, capture_output=True)
+    if result.returncode or not re.match(r"\(true,", result.stdout.strip()):
+        raise RuntimeError("Cinnamon rejected the desktop launch; no authentication retry was attempted")
+
+
+def authorize(command, stage, method):
+    if method == "sudo-n":
+        # Explicit opt-in only: sudo -n cannot read or prompt for a password.
+        result = subprocess.run(["sudo", "-n", "--"]+command)
+        if result.returncode:
+            raise RuntimeError("Configured noninteractive sudo authorization or installation failed; no password fallback")
+        return
+    if method == "none":
+        raise RuntimeError("System installation needs an authorized root session or graphical authentication")
+    try:
+        route = linux_desktop() if platform.system() == "Linux" else mac_desktop()
+    except RuntimeError as error:
+        local = ["pkexec", "--disable-internal-agent"]+command if platform.system() == "Linux" else ["osascript", "-e", "do shell script "+json.dumps(shlex.join(command))+" with administrator privileges"]
+        raise DesktopUnavailable(str(error)+". Prepared files retained; run at the target machine's local desktop: "+shlex.join(local)) from error
+    if route["kind"] == "direct":
+        print("An administrator window will appear on the target machine's physical desktop. Enter the password only in that graphical window.", flush=True)
+        result = subprocess.run(["pkexec", "--disable-internal-agent"]+command, env=route["env"])
+        if result.returncode:
+            raise RuntimeError("Graphical authentication or installation failed; no retry or terminal password fallback")
+        return
+    script, manifest = str(stage/"installer.py"), str(stage/"manifest.json")
+    worker = [sys.executable, script, "--auth-worker", manifest]
+    if route.get("agent"):
+        worker += ["--session-agent", route["agent"]]
+    label = None
+    if route["kind"] == "cinnamon":
+        # Validate the session scope with an unprivileged probe before any prompt.
+        probe = stage/"session-probe.sh"
+        probe.write_text("#!/bin/sh\ncat /proc/self/cgroup > "+shlex.quote(str(stage/"session-scope"))+"\n")
+        probe.chmod(0o700)
+        cinnamon_spawn(route, probe)
+        if route["scope"] not in wait_desktop_result(stage, "session-scope", 10):
+            raise RuntimeError("Desktop probe did not enter the expected graphical session; authentication was not started")
+        wrapper = stage/"authorize.sh"
+        wrapper.write_text("#!/bin/sh\nexec "+shlex.join(worker)+"\n")
+        wrapper.chmod(0o700)
+    print("An administrator authentication window will appear on the TARGET MACHINE'S PHYSICAL DESKTOP (not in SSH). Enter the password only in that graphical window.", flush=True)
+    if route["kind"] == "cinnamon":
+        cinnamon_spawn(route, wrapper)
+    else:
+        label = "com.komari.traffic-auth."+uuid.uuid4().hex
+        plist = stage/"authorize.plist"
+        plist.write_bytes(plistlib.dumps(dict(Label=label, ProgramArguments=worker, RunAtLoad=True, StandardOutPath=str(stage/"worker.log"), StandardErrorPath=str(stage/"worker.log"))))
+        run(["launchctl", "bootstrap", route["domain"], str(plist)])
+    try:
+        code = int(wait_desktop_result(stage, "authorization-result", 600))
+    except AuthenticationPending:
+        # The GUI worker can still finish. Do not boot it out or remove its files.
+        raise
+    else:
+        if label:
+            run(["launchctl", "bootout", route["domain"]+"/"+label], False)
+    log = stage/"authorization.log"
+    if log.exists():
+        print(log.read_text(), end="")
+    if code:
+        raise RuntimeError(f"Desktop authentication cancelled or installation failed (exit {code}); no retry or password fallback")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Patch an existing Linux/macOS Komari Agent using verified release binaries")
     parser.add_argument("--repo", default=DEFAULT_REPO)
@@ -294,8 +481,19 @@ def main(argv=None):
     parser.add_argument("--no-restart", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="show detected target without downloads or changes")
     parser.add_argument("--download-only", metavar="DIRECTORY")
+    parser.add_argument("--auth", choices=["auto", "desktop", "sudo-n", "none"], default="auto", help="SSH: target desktop authentication, or explicit configured noninteractive sudo")
+    parser.add_argument("--auth-check", action="store_true", help="read-only detection of desktop authentication route")
+    parser.add_argument("--auth-worker", help=argparse.SUPPRESS)
+    parser.add_argument("--session-agent", help=argparse.SUPPRESS)
     parser.add_argument("--apply", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.auth_worker:
+        auth_worker(args.auth_worker, args.session_agent)
+        return
+    if args.auth_check:
+        route = linux_desktop() if platform.system() == "Linux" else mac_desktop()
+        print(json.dumps({key:value for key,value in route.items() if key != "env"}, indent=2))
+        return
     if args.apply:
         apply(args.apply)
         return
@@ -335,18 +533,11 @@ def main(argv=None):
         shutil.copy2(__file__, script)
         command = [sys.executable, str(script), "--apply", str(manifest)]
         if plan["scope"] == "system" and os.geteuid() != 0:
-            if platform.system() == "Linux":
-                if os.environ.get("SSH_CONNECTION") or not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-                    keep_stage = True
-                    raise RuntimeError("Cannot verify graphical authentication from this session. Run at the target machine's local desktop: "+shlex.join(["pkexec", "--disable-internal-agent"]+command))
-                print("An administrator authentication window will appear on this desktop. Enter your password only in that graphical window.", flush=True)
-                result = subprocess.run(["pkexec", "--disable-internal-agent"]+command)
-            else:
-                print("A macOS administrator authentication window will appear. Enter your password only in that graphical window.", flush=True)
-                apple_command = "do shell script "+json.dumps(shlex.join(command))+" with administrator privileges"
-                result = subprocess.run(["osascript", "-e", apple_command])
-            if result.returncode:
-                raise RuntimeError(f"graphical authorization or installation failed (exit {result.returncode}); no terminal password fallback")
+            try:
+                authorize(command, stage, args.auth)
+            except (DesktopUnavailable, AuthenticationPending, KeyboardInterrupt):
+                keep_stage = True
+                raise
         else:
             apply(manifest)
     finally:

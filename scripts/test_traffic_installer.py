@@ -102,5 +102,81 @@ class InstallerTests(unittest.TestCase):
             installer.valid_repo("x/y?token=oops")
 
 
+class AuthenticationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.stage = pathlib.Path(self.temp.name)
+        self.command = ["/usr/bin/python3", str(self.stage/"installer.py"), "--apply", str(self.stage/"manifest.json")]
+        self.route = dict(kind="cinnamon",scope="session-c6.scope",env={},agent=None)
+
+    def spawn(self, route, wrapper):
+        if wrapper.name == "session-probe.sh":
+            (self.stage/"session-scope").write_text("0::/user.slice/session-c6.scope")
+        else:
+            (self.stage/"authorization-result").write_text("0")
+
+    def test_ssh_cinnamon_uses_gui_session_and_fixed_wrappers(self):
+        with patch.dict(os.environ, {"SSH_CONNECTION":"remote connection"}), patch.object(installer.platform,"system",return_value="Linux"), patch.object(installer,"linux_desktop",return_value=self.route), patch.object(installer,"cinnamon_spawn",side_effect=self.spawn) as spawn, contextlib.redirect_stdout(io.StringIO()) as output:
+            installer.authorize(self.command,self.stage,"auto")
+        self.assertEqual(spawn.call_count,2)
+        self.assertIn("PHYSICAL DESKTOP",output.getvalue())
+        self.assertIn("--auth-worker",(self.stage/"authorize.sh").read_text())
+
+    def test_wrong_graphical_scope_never_starts_authentication(self):
+        def wrong_scope(route,wrapper):
+            (self.stage/"session-scope").write_text("0::/wrong-session.scope")
+        with patch.object(installer.platform,"system",return_value="Linux"), patch.object(installer,"linux_desktop",return_value=self.route), patch.object(installer,"cinnamon_spawn",side_effect=wrong_scope) as spawn:
+            with self.assertRaisesRegex(RuntimeError,"expected graphical session"):
+                installer.authorize(self.command,self.stage,"auto")
+        self.assertEqual(spawn.call_count,1)
+        self.assertFalse((self.stage/"authorize.sh").exists())
+
+    def test_cancelled_authentication_never_retries(self):
+        def cancelled(route,wrapper):
+            self.spawn(route,wrapper)
+            if wrapper.name == "authorize.sh":
+                (self.stage/"authorization-result").write_text("126")
+        with patch.object(installer.platform,"system",return_value="Linux"), patch.object(installer,"linux_desktop",return_value=self.route), patch.object(installer,"cinnamon_spawn",side_effect=cancelled) as spawn, patch.object(installer.subprocess,"run") as run, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError,"cancelled"):
+                installer.authorize(self.command,self.stage,"auto")
+        self.assertEqual(spawn.call_count,2)
+        run.assert_not_called()
+
+    def test_headless_ssh_does_not_attempt_terminal_authentication(self):
+        with patch.object(installer.platform,"system",return_value="Linux"), patch.object(installer,"linux_desktop",side_effect=RuntimeError("No desktop")), patch.object(installer.subprocess,"run") as run:
+            with self.assertRaisesRegex(installer.DesktopUnavailable,"local desktop"):
+                installer.authorize(self.command,self.stage,"auto")
+        run.assert_not_called()
+
+    def test_explicit_sudo_n_cannot_prompt_or_retry(self):
+        result = subprocess_result(1)
+        with patch.object(installer.subprocess,"run",return_value=result) as run:
+            with self.assertRaisesRegex(RuntimeError,"noninteractive"):
+                installer.authorize(self.command,self.stage,"sudo-n")
+        run.assert_called_once_with(["sudo","-n","--"]+self.command)
+
+    def test_mac_ssh_bootstraps_one_shot_gui_launchagent(self):
+        with patch.object(installer.platform,"system",return_value="Darwin"), patch.object(installer,"mac_desktop",return_value=dict(kind="launchd-auth",domain="gui/501")), patch.object(installer,"run") as run, patch.object(installer,"wait_desktop_result",return_value="0"), contextlib.redirect_stdout(io.StringIO()):
+            installer.authorize(self.command,self.stage,"desktop")
+        plist=plistlib.loads((self.stage/"authorize.plist").read_bytes())
+        self.assertIn("--auth-worker",plist["ProgramArguments"])
+        self.assertNotIn("KeepAlive",plist)
+        self.assertEqual(run.call_args_list[0].args[0][:3],["launchctl","bootstrap","gui/501"])
+        self.assertEqual(run.call_args_list[1].args[0][:2],["launchctl","bootout"])
+
+    def test_worker_reports_cancelled_exit_and_disables_text_agent(self):
+        with patch.object(installer.platform,"system",return_value="Linux"), patch.object(installer.subprocess,"run",return_value=subprocess_result(126)) as run:
+            installer.auth_worker(self.stage/"manifest.json")
+        self.assertEqual((self.stage/"authorization-result").read_text(),"126")
+        self.assertEqual(run.call_args.args[0][:2],["pkexec","--disable-internal-agent"])
+        self.assertNotIn("input",run.call_args.kwargs)
+
+
+def subprocess_result(code):
+    from types import SimpleNamespace
+    return SimpleNamespace(returncode=code)
+
+
 if __name__ == "__main__":
     unittest.main()

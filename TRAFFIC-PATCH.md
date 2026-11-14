@@ -21,7 +21,32 @@ sh install-komari-traffic-patch.sh --dry-run
 
 二进制从 GitHub Release 下载；安装前强制校验 GitHub API 提供的 SHA-256 digest，拒绝无摘要或校验失败的资产。Release 同时包含 `SHA256SUMS`。脚本会先备份二进制和服务设置；启动失败时恢复备份，不打印令牌或服务命令行。
 
-系统级安装使用 Linux Polkit / macOS 图形认证窗口，密码只在图形窗口输入。脚本不会使用终端密码回退。SSH/无法确认图形认证的会话会输出已准备的命令，供目标机器的本地图形桌面执行。用户级安装不需要管理员权限。
+系统级安装使用 Linux Polkit / macOS 图形认证窗口，密码只在图形窗口输入。脚本不会使用终端密码回退。SSH 可使用目标机器的活动图形会话认证（下节说明）；没有可用桌面时输出已准备的命令，供目标机器的本地图形桌面执行。用户级安装不需要管理员权限。
+
+## SSH 下认证
+
+SSH 不再被直接拒绝，默认 `--auth auto` 会探测真实的目标桌面：
+
+- **Linux Cinnamon**：确认同一用户的活动本地图形登录、会话 D-Bus、Cinnamon 拥有者和会话 scope。先由 Cinnamon 启动无特权探测脚本，验证它进入正确 `session-*.scope`，再在该会话内发起 Polkit。若会话没有运行认证代理，但安装了 GNOME Polkit 代理，则在该图形会话临时启动一个；不重复启动或重试认证。
+- **Linux GNOME/KDE 等**：本地图形终端可在验证进程与代理属于同一会话后直接使用 Polkit。目前不冒用 Cinnamon 接口从 SSH 启动其他桌面；可使用下面的免交互机制。
+- **macOS**：确认 SSH 用户就是当前物理桌面登录用户，通过 `launchctl bootstrap gui/<uid>` 启动一次性授权任务，让管理员窗口出现在该桌面，任务结束后卸载。
+
+**认证窗口在目标机器的物理桌面，不在 SSH 终端，也不因 X11 转发而转移。** 脚本触发前明确提醒，只在图形窗口输入密码。取消即停止，不回退到终端索取密码。
+
+```sh
+# 只探测认证路线，不提权、不弹窗、不安装
+sh install-komari-traffic-patch.sh --auth-check
+
+# SSH + 可用的目标桌面（默认行为）
+sh install-komari-traffic-patch.sh --auth desktop
+
+# 纯无头 SSH：显式选择事先已配置的免交互 sudo
+sh install-komari-traffic-patch.sh --auth sudo-n
+```
+
+`sudo-n` 仅运行 `sudo -n`，不会配置 sudoers、请求/读取密码或改用其他认证方式；现有规则不允许该操作时立即失败。也可以由用户在现有 root SSH 会话直接执行脚本，或使用不需要管理员权限的用户级安装。`--auth none` 禁止脚本自动提权。
+
+无法找到可靠桌面路线时会保留准备文件并给出本地执行命令。桌面授权等待超过 10 分钟或 SSH 端按 Ctrl+C 后，保留暂存文件，避免删除仍在使用的安装文件；需在目标桌面关闭窗口、确认任务结束后再重试。
 
 ## 安装参数
 
