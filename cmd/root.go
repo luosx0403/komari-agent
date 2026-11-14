@@ -13,7 +13,6 @@ import (
 	"os/signal"
 	"reflect"
 	"strconv"
-	"strings"
 	"syscall"
 
 	"github.com/komari-monitor/komari-agent/dnsresolver"
