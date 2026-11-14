@@ -10,3 +10,7 @@ auto-discovery.json
 fake-agent-client.json
 net_static.json
 config.json
+
+network-total.json
+network-total.json.lock
+.traffic-patch-backups/

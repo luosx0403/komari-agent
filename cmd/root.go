@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -52,13 +54,39 @@ var RootCmd = &cobra.Command{
 		if flags.PreferIPVersion != "" && flags.PreferIPVersion != "4" && flags.PreferIPVersion != "6" {
 			return fmt.Errorf("invalid --prefer-ip-version value %q: expected 4 or 6", flags.PreferIPVersion)
 		}
+		if flags.UpdateRepo != "" {
+			repo := flags.UpdateRepo
+			if repo == "official" {
+				repo = "komari-monitor/komari-agent"
+			}
+			if err := update.SetRepository(repo); err != nil {
+				return err
+			}
+		}
+		switch flags.NetworkMode {
+		case "official":
+		case "lifetime":
+			if flags.MonthRotate != 0 {
+				return fmt.Errorf("network-mode=lifetime cannot be combined with month-rotate")
+			}
+			if flags.NetworkSaveInterval < 0.1 || flags.NetworkSaveInterval > 3600 || math.IsNaN(flags.NetworkSaveInterval) || math.IsInf(flags.NetworkSaveInterval, 0) {
+				return fmt.Errorf("network-save-interval must be between 0.1 and 3600 seconds")
+			}
+			if err := monitoring.StartPersistentNetwork(flags.NetworkStateFile, flags.NetworkSaveInterval); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("network-mode must be official or lifetime")
+		}
 		// 捕获中止信号，优雅退出
 		stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 
 		stopWarning := startSecurityWarning(stopCtx)
 		defer stopWarning()
-		shutdown := newShutdownCoordinator(stopWarning, netstatic.Stop, os.Exit)
+		shutdown := newShutdownCoordinator(stopWarning, func() error {
+			return errors.Join(monitoring.StopPersistentNetwork(), netstatic.Stop())
+		}, os.Exit)
 		go func() {
 			<-stopCtx.Done()
 			log.Printf("shutting down gracefully...")
@@ -160,6 +188,10 @@ func Execute() {
 }
 
 func init() {
+	RootCmd.PersistentFlags().StringVar(&flags.NetworkMode, "network-mode", "official", "Network totals: official or lifetime (Linux/macOS)")
+	RootCmd.PersistentFlags().StringVar(&flags.NetworkStateFile, "network-state-file", "", "Absolute lifetime state path; default ./network-total.json")
+	RootCmd.PersistentFlags().Float64Var(&flags.NetworkSaveInterval, "network-save-interval", 5, "Background lifetime checkpoint interval in seconds; reports also checkpoint")
+	RootCmd.PersistentFlags().StringVar(&flags.UpdateRepo, "update-repo", "", "Update repository owner/name, or official; default is the build repository")
 	RootCmd.PersistentFlags().StringVarP(&flags.Token, "token", "t", "", "API token")
 	//RootCmd.MarkPersistentFlagRequired("token")
 	RootCmd.PersistentFlags().StringVarP(&flags.Endpoint, "endpoint", "e", "", "API endpoint")

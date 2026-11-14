@@ -1,0 +1,101 @@
+name: Test and Release Lifetime Traffic
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: traffic-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    if: github.repository == 'luosx0403/komari-agent'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l monitoring/nettotal monitoring/unit/net_lifetime.go cmd/build_info.go update/repository_test.go)"
+      - name: Run unit and race tests
+        # Upstream integration tests need raw ICMP sockets and particular public
+        # IPv4/IPv6 hosts; keep them out of deterministic CI on hosted runners.
+        run: go test -race -skip '^(TestICMPPing|TestTCPPing|TestHTTPPing)$' ./...
+      - name: Test installer and rollback
+        run: python3 -m unittest discover -s scripts -p 'test_traffic_installer.py' -v
+      - name: Check shell entry point
+        run: python3 -m py_compile install-traffic-patch.sh && sh install-traffic-patch.sh --help
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Compile release binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+          RUN_NUMBER: ${{ github.run_number }}
+          UPDATE_REPO: ${{ github.repository }}
+        run: |
+          VERSION="1.5.$((10000 + RUN_NUMBER))"
+          go build -trimpath -ldflags="-s -w -X github.com/komari-monitor/komari-agent/update.CurrentVersion=${VERSION} -X github.com/komari-monitor/komari-agent/update.Repo=${UPDATE_REPO}" -o "komari-agent-${GOOS}-${GOARCH}" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: komari-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: komari-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          retention-days: 14
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Publish tested release and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          VERSION="1.5.$((10000 + RUN_NUMBER))"
+          cp install-traffic-patch.sh release-assets/
+          cp TRAFFIC-PATCH.md release-assets/
+          (cd release-assets && sha256sum komari-agent-* install-traffic-patch.sh TRAFFIC-PATCH.md > SHA256SUMS)
+          cat > release-notes.md <<NOTES
+          Lifetime traffic totals for Linux and macOS, amd64 and arm64.
+          Built from commit ${GITHUB_SHA}. Native Linux/macOS tests passed before publishing.
+          Agent auto-update remains enabled by default and tracks ${GH_REPO}.
+          Installation and rollback: see TRAFFIC-PATCH.md.
+          Upstream baseline: ddbdbdcdaeb12abc0e68ba5bc2f0a6b914dad3a7.
+          NOTES
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            echo "Release already exists; refusing to replace published binaries."
+            exit 1
+          fi
+          gh release create "${VERSION}" release-assets/* --target "${GITHUB_SHA}" --title "Lifetime Traffic ${VERSION}" --notes-file release-notes.md --latest

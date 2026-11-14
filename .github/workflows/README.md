@@ -271,3 +271,11 @@ Before changing these workflows, check:
 - Binary asset names still match updater, installer, and Dockerfile expectations.
 - `update.CurrentVersion` is still embedded in all release-producing binaries.
 - Race protection still prevents stale `main` commits from publishing snapshots.
+
+## Lifetime-traffic fork
+
+In `luosx0403/komari-agent`, `traffic-release.yml` is the release owner. It runs
+native Linux/macOS race and installer tests, cross-compiles four release assets,
+and publishes checksums plus the one-command patch installer. The inherited
+upstream workflows are repository-gated to avoid duplicate releases and Docker
+publishing in the fork. See `TRAFFIC-PATCH.md` for versions and rollback.

@@ -217,6 +217,9 @@ type VnstatOutput struct {
 }
 
 func NetworkSpeed() (totalUp, totalDown, upSpeed, downSpeed uint64, err error) {
+	if flags.NetworkMode == "lifetime" {
+		return persistentNetworkSpeed()
+	}
 	includeNics := parseNics(flags.IncludeNics)
 	excludeNics := parseNics(flags.ExcludeNics)
 

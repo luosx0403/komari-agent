@@ -1,3 +1,5 @@
+> 本 fork 提供 Linux/macOS 永久累计流量模式、自动更新和一键补丁/回滚。参见 [TRAFFIC-PATCH.md](TRAFFIC-PATCH.md)。
+
 # komari-agent
 
 ## 配置方式

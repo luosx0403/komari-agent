@@ -328,6 +328,20 @@ func splitRepoSlug(slug string) (string, string, error) {
 	return parts[0], parts[1], nil
 }
 
+// SetRepository changes the update source without changing auto-update policy.
+func SetRepository(slug string) error {
+	if _, _, err := splitRepoSlug(slug); err != nil {
+		return err
+	}
+	for _, c := range slug {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.' || c == '/') {
+			return fmt.Errorf("invalid update repository")
+		}
+	}
+	Repo = slug
+	return nil
+}
+
 func getRepoReleases(list releaseLister) ([]githubRelease, error) {
 	owner, repo, err := splitRepoSlug(Repo)
 	if err != nil {
