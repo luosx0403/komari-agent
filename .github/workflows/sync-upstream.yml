@@ -53,6 +53,12 @@ jobs:
           echo 'changed=true' >> "$GITHUB_OUTPUT"
           echo "Merged as $(git rev-parse HEAD)." >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Refresh upstream version label without rebuilding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/upstream_metadata.py --refresh-latest
+
   build-release:
     needs: sync
     if: needs.sync.outputs.changed == 'true'

@@ -300,3 +300,19 @@ merge if GitHub rejects the push. No long-lived credential is provisioned.
 
 GitHub may disable public-repository scheduled workflows after 60 days without
 repository activity; re-enable this workflow if that occurs.
+
+
+### Official release labels
+
+Fork tags intentionally keep the `1.5.100xx` version line so already-installed
+agents continue to receive automatic patch updates. They are not the upstream
+version number. Release titles and notes show the highest stable official tag
+actually contained in the build, plus the included official source commit.
+`scripts/upstream_metadata.py` checks Git ancestry; a newer upstream tag that is
+not in the build is never attributed to it.
+
+A scheduled sync with no new source skips compilation. It still refreshes the
+latest existing release's upstream label, because the official project can
+publish a new tag for a commit the fork already built earlier. This changes
+release metadata only, never binary assets. Thus daily successful sync checks
+are not daily binary builds.
